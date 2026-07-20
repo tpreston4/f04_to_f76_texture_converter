@@ -11,8 +11,8 @@ Make sure you have python installed, and you'll need both pillow and texfury to 
 pip install texfury pillow
 ```
 
-Texfury - used for BC7 encoding
-Pillow - used for processing images
+- Texfury - used for BC7 encoding
+- Pillow - used for processing images
 
 
 
