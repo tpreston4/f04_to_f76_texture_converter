@@ -276,11 +276,8 @@ def _norm_tex_path(p: str) -> str:
 
 
 def _bgsm_set_keys(info: "BgsmInfo") -> set:
-    # Base path(s) (texture path minus the type suffix) this material's textures imply.
-    # Authors name them differently - Heels_d/Heels_n/Heels_s, Heels.dds/Heels_n, or
-    # BaseD/BaseN/BaseS with no underscore - so every plausible reading is tried per texture
-    # and the base that the most of the material's textures agree on wins. That keeps
-    # "BaseD" from being mistaken for a set called "based".
+    # Check for different naming conventions.
+    # We also try to search based on the bgsm file as well, but this is a fallback
     variants = (
         (info.diffuse, ("_d", "d", "")),
         (info.normal, ("_n", "n")),
@@ -438,14 +435,8 @@ def find_bgsm_matches(index: dict, diffuse_file: Path):
 # ------------------------------------------------------------------------------
 # FO76 .bgsm writer
 #
-# Built from four real FO76 (version 22) example files. All four had an identical header
-# and an identical block after the texture list; only the texture paths differed. So the
-# file is assembled as: header + 10 texture slots + that block, and the writer reproduces
-# those example files byte for byte (checked when this was written). The block after the
-# textures (translucency, specular, wetness, emittance, ... settings) is the examples' own
-# default values copied as-is, not decoded field by field - so this writes material files
-# that match your examples, and doesn't expose settings beyond the texture paths and the
-# header flags below.
+# Still a WIP, but seems to work as expected for simple bgsm files
+# You may need to fix them after they're created
 # ------------------------------------------------------------------------------
 FO76_BGSM_VERSION = 22
 
@@ -468,7 +459,7 @@ FO76_DEFAULT_HEADER = {
 # Remaining header bytes the examples share: depth bias, grayscale-to-palette, mask writes.
 _FO76_HEADER_TRAILER = bytes([0x00, 0x00, 0x3F])
 
-# Everything after the 10 texture slots, identical across the example files.
+# Everything after the 10 texture slots.
 _FO76_BGSM_TAIL = bytes.fromhex(
     "00 00 00 01 00 00 80 3f 00 00 80 3f 00 00 80 3f 00 00 80 3f 00 00 00 3f 01 00 00 80 3f "
     "00 00 80 3f 00 00 80 3f 00 00 80 3f 00 00 80 3f 00 00 a0 40 00 00 80 bf 00 00 80 bf "
@@ -547,6 +538,7 @@ def write_fo76_bgsm(jobs: list, material_dir: Path, tex_root: Path, header: dict
 # Cubemap file-name keywords -> built-in preset. Order matters: the first hit wins, so the
 # specific names come before the generic "metal". This is a name-based heuristic - the
 # .bgsm only stores a path to the cubemap, not what material it represents.
+# reminder to self, add more if you find more
 CUBEMAP_KEYWORDS = [
     (("chrome",), "Chrome"),
     (("gold", "brass"), "Gold / Brass"),
@@ -559,6 +551,7 @@ CUBEMAP_KEYWORDS = [
 ]
 # Presets whose reflections are visibly colored (not neutral), so the reflection map gets
 # tinted with the preset's color.
+# reminder to self, add more if you find more/need more added
 TINTED_PRESETS = {"Gold / Brass", "Copper"}
 
 
