@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-# Version: 9.0
+# Version: 9.5
 
 import os
 import sys
 import math
+import struct
 import json
 import shutil
 import subprocess
@@ -164,6 +165,461 @@ MATERIAL_PRESETS = {
     "Dull Unpolished":  (120, 0.9, 0.5, (100, 100, 105))
 }
 
+# ------------------------------------------------------------------------------
+# FO4 .bgsm material reader
+#
+# A .bgsm is the material file FO4 meshes point at. It's where the environment map
+# (cubemap) lives - the textures themselves (_d/_n/_s) never contain it. Layout
+# below is for BGSM version 2 (what FO4 uses), checked against real sample files:
+# the parse has to consume the file exactly and land on sane values, otherwise the
+# file is rejected rather than half-trusted. Other versions have different layouts
+# (FO76's, for example), so they're skipped with a clear message, not guessed at.
+# ------------------------------------------------------------------------------
+BgsmInfo = namedtuple("BgsmInfo", [
+    "version", "env_mapping", "env_mask_scale", "diffuse", "normal", "spec", "cubemap",
+    "specular_enabled", "specular_color", "specular_mult", "smoothness", "fresnel_power",
+    "header",
+])
+
+
+class _BgsmReader:
+    def __init__(self, data: bytes, pos: int = 0):
+        self.d = data
+        self.p = pos
+
+    def _take(self, fmt: str):
+        size = struct.calcsize(fmt)
+        if self.p + size > len(self.d):
+            raise ValueError("unexpected end of file")
+        v = struct.unpack_from(fmt, self.d, self.p)
+        self.p += size
+        return v[0] if len(v) == 1 else v
+
+    def u8(self):
+        return self._take("<B")
+
+    def u32(self):
+        return self._take("<I")
+
+    def f32(self):
+        return self._take("<f")
+
+    def skip(self, n: int):
+        if self.p + n > len(self.d):
+            raise ValueError("unexpected end of file")
+        self.p += n
+
+    def string(self) -> str:
+        n = self.u32()          # length includes the trailing NUL
+        if n > 1024 or self.p + n > len(self.d):
+            raise ValueError("bad string length")
+        raw = self.d[self.p:self.p + n]
+        self.p += n
+        return raw.rstrip(b"\0").decode("latin-1")
+
+
+def read_bgsm(path) -> "BgsmInfo":
+    data = Path(path).read_bytes()
+    if data[:4] != b"BGSM":
+        raise ValueError("not a BGSM file")
+    version = struct.unpack_from("<I", data, 4)[0]
+    if version != 2:
+        raise ValueError(f"BGSM version {version} isn't supported (only version 2, used by Fallout 4)")
+
+    r = _BgsmReader(data, 8)
+    # This part of the header is laid out identically in FO4 (v2) and FO76 (v22) files,
+    # which is what lets a converted material inherit it.
+    header = {}
+    header["tile"] = r.u32()
+    header["uv"] = (r.f32(), r.f32(), r.f32(), r.f32())     # U/V offset, U/V scale
+    header["alpha"] = r.f32()
+    header["blend"] = (r.u8(), r.u32(), r.u32())            # mode, source, destination
+    header["flags"] = tuple(r.u8() for _ in range(12))      # see FO76_HEADER_FLAG_NAMES
+    header["refraction_power"] = r.f32()
+    env_mapping = bool(r.u8())
+    env_mask_scale = r.f32()
+    r.u8()                        # grayscale to palette color
+
+    diffuse, normal, spec, _greyscale = r.string(), r.string(), r.string(), r.string()
+    cubemap = r.string()
+    for _ in range(4):            # glow, inner layer, wrinkles, displacement
+        r.string()
+
+    r.u8()                        # enable editor alpha ref
+    r.u8(); r.f32(); r.f32()      # rim lighting, rim power, back light power
+    r.u8(); r.f32()               # subsurface lighting, rolloff
+    specular_enabled = bool(r.u8())
+    specular_color = (r.f32(), r.f32(), r.f32())
+    specular_mult = r.f32()
+    smoothness = r.f32()
+    fresnel_power = r.f32()
+    r.skip(6 * 4)                 # wetness control: spec scale, spec power scale, spec min var,
+                                  # env map scale, fresnel power, metalness
+    root_path = r.string()
+
+    # Sanity checks: a wrong layout would drift into garbage by here.
+    if not (0.0 <= env_mask_scale <= 100.0) or not (0.0 <= smoothness <= 10.0):
+        raise ValueError("values out of range - layout doesn't match")
+    if root_path and not root_path.lower().endswith(".bgsm"):
+        raise ValueError("layout doesn't match (root material path)")
+
+    return BgsmInfo(version, env_mapping, env_mask_scale, diffuse, normal, spec, cubemap,
+                    specular_enabled, specular_color, specular_mult, smoothness, fresnel_power,
+                    header)
+
+
+def _norm_tex_path(p: str) -> str:
+    p = (p or "").replace("\\", "/").strip().lstrip("/").lower()
+    if p.startswith("textures/"):
+        p = p[len("textures/"):]
+    return p
+
+
+def _bgsm_set_keys(info: "BgsmInfo") -> set:
+    # Base path(s) (texture path minus the type suffix) this material's textures imply.
+    # Authors name them differently - Heels_d/Heels_n/Heels_s, Heels.dds/Heels_n, or
+    # BaseD/BaseN/BaseS with no underscore - so every plausible reading is tried per texture
+    # and the base that the most of the material's textures agree on wins. That keeps
+    # "BaseD" from being mistaken for a set called "based".
+    variants = (
+        (info.diffuse, ("_d", "d", "")),
+        (info.normal, ("_n", "n")),
+        (info.spec, ("_s", "s", "_r", "r")),
+    )
+    counts = {}
+    for tex, suffixes in variants:
+        t = _norm_tex_path(tex)
+        if not t.endswith(".dds"):
+            continue
+        stem = t[:-4]
+        seen = set()
+        for suf in suffixes:
+            if suf and not stem.endswith(suf):
+                continue
+            base = stem[:len(stem) - len(suf)] if suf else stem
+            # a bare letter suffix ("d") must not leave a dangling underscore behind
+            if suf and not suf.startswith("_") and base.endswith("_"):
+                continue
+            if base and not base.endswith("/"):
+                seen.add(base)
+        for base in seen:
+            counts[base] = counts.get(base, 0) + 1
+    if not counts:
+        return set()
+    best = max(counts.values())
+    return {b for b, c in counts.items() if c == best}
+
+
+def load_bgsm_materials(materials_dir: Path):
+    # Every readable .bgsm under materials_dir (all subfolders) as [(BgsmInfo, path)], plus
+    # a list of "file: reason" strings for the ones that were skipped.
+    materials, errors = [], []
+    for root, dirs, files in os.walk(materials_dir):
+        dirs.sort()
+        for fn in sorted(files):
+            if not fn.lower().endswith(".bgsm"):
+                continue
+            fp = Path(root) / fn
+            try:
+                materials.append((read_bgsm(fp), fp))
+            except Exception as e:
+                errors.append(f"{fn}: {e}")
+    return materials, errors
+
+
+def index_bgsm_materials(materials: list) -> dict:
+    # base-name -> [(base_key, BgsmInfo, bgsm_path)]
+    index = {}
+    for info, fp in materials:
+        for key in _bgsm_set_keys(info):
+            index.setdefault(key.rsplit("/", 1)[-1], []).append((key, info, fp))
+    return index
+
+
+def build_bgsm_index(materials_dir: Path):
+    materials, errors = load_bgsm_materials(materials_dir)
+    return index_bgsm_materials(materials), len(materials), errors
+
+
+# --- Finding texture sets from the materials themselves (instead of *_d.dds naming) ---
+def build_dds_index(in_dir: Path) -> dict:
+    idx = {}
+    for root, _dirs, files in os.walk(in_dir):
+        for fn in files:
+            if fn.lower().endswith(".dds"):
+                idx.setdefault(fn.lower(), []).append(Path(root) / fn)
+    return idx
+
+
+def locate_texture(dds_index: dict, tex_path: str):
+    # Finds the file a material's texture path refers to. Returns (Path or None, note).
+    # Same rule as material matching: the candidate sharing the most trailing folders wins,
+    # so it works whether or not Input Dir keeps the folders the material names.
+    t = _norm_tex_path(tex_path)
+    if not t.endswith(".dds"):
+        return None, "not listed"
+    parts = t.split("/")
+    cands = dds_index.get(parts[-1], [])
+    if not cands:
+        return None, "not found in Input Dir"
+    scored = []
+    for c in cands:
+        cparts = os.path.abspath(str(c)).replace("\\", "/").lower().split("/")
+        n = 0
+        while n < min(len(parts), len(cparts)) and parts[-1 - n] == cparts[-1 - n]:
+            n += 1
+        scored.append((n, c))
+    best = max(n for n, _c in scored)
+    top = [c for n, c in scored if n == best]
+    if len(top) > 1:
+        return None, "several files with that name in different folders"
+    return top[0], ("" if best == len(parts) else "matched by file name only")
+
+
+def discover_texture_sets(materials: list, in_dir: Path, materials_root: Path = None):
+    # One texture set per material whose diffuse texture exists in in_dir. Returns
+    # (sets, skipped): sets are dicts (key, diffuse, normal, spec, info, fp); skipped are
+    # "file: reason" strings for materials whose diffuse couldn't be found.
+    dds_index = build_dds_index(in_dir)
+    sets, skipped = [], []
+    for info, fp in materials:
+        diffuse, note = locate_texture(dds_index, info.diffuse)
+        if diffuse is None:
+            skipped.append(f"{fp.name}: diffuse '{info.diffuse}' {note}")
+            continue
+        normal, _n = locate_texture(dds_index, info.normal)
+        spec, _s = locate_texture(dds_index, info.spec)
+        try:
+            key = fp.relative_to(materials_root).with_suffix("").as_posix()
+        except Exception:
+            key = fp.stem
+        sets.append(dict(key=key, diffuse=diffuse, normal=normal, spec=spec, info=info, fp=fp))
+    sets.sort(key=lambda d: d["key"].lower())
+    return sets, skipped
+
+
+def find_bgsm_matches(index: dict, diffuse_file: Path):
+    # Returns (matches, note). A material's texture paths (e.g. DX/RedRibbon/Heels) are
+    # compared with the set's real path from the end, and the candidate(s) sharing the most
+    # trailing folders win - so it still matches when the input folder is flat or renamed,
+    # as long as the file name is unambiguous.
+    full = os.path.abspath(str(diffuse_file)).replace("\\", "/").lower()
+    if full.endswith("_d.dds"):
+        full = full[:-6]
+    else:
+        full = full.rsplit(".", 1)[0]
+    parts = full.split("/")
+    last = parts[-1]
+
+    scored = []
+    for key, info, fp in index.get(last, []):
+        kparts = key.split("/")
+        n = 0
+        while n < min(len(parts), len(kparts)) and parts[-1 - n] == kparts[-1 - n]:
+            n += 1
+        scored.append((n, key, info, fp))
+    if not scored:
+        return [], f"no .bgsm references a texture set named '{last}'"
+
+    best = max(c[0] for c in scored)
+    top = [c for c in scored if c[0] == best]
+    if len({c[1] for c in top}) > 1:
+        dirs = ", ".join(sorted({c[1] for c in top})[:3])
+        return [], (f"several materials use a texture named '{last}' in different folders ({dirs}); "
+                    f"can't tell which applies")
+    found = {str(c[3]): (c[2], c[3]) for c in top}
+    matches = [found[k] for k in sorted(found)]
+    note = ""
+    if best < len(top[0][1].split("/")):
+        note = "matched by file name only (folder layout differs from the .bgsm)"
+    return matches, note
+
+
+# ------------------------------------------------------------------------------
+# FO76 .bgsm writer
+#
+# Built from four real FO76 (version 22) example files. All four had an identical header
+# and an identical block after the texture list; only the texture paths differed. So the
+# file is assembled as: header + 10 texture slots + that block, and the writer reproduces
+# those example files byte for byte (checked when this was written). The block after the
+# textures (translucency, specular, wetness, emittance, ... settings) is the examples' own
+# default values copied as-is, not decoded field by field - so this writes material files
+# that match your examples, and doesn't expose settings beyond the texture paths and the
+# header flags below.
+# ------------------------------------------------------------------------------
+FO76_BGSM_VERSION = 22
+
+# Order of the 12 single-byte flags in the header.
+FO76_HEADER_FLAG_NAMES = (
+    "alpha_test_ref", "alpha_test", "z_write", "z_test", "screen_space_reflections",
+    "wetness_ssr", "decal", "two_sided", "decal_no_fade", "non_occluder",
+    "refraction", "refraction_falloff",
+)
+
+# Header values taken from the FO76 example files.
+FO76_DEFAULT_HEADER = {
+    "tile": 3,
+    "uv": (0.0, 0.0, 1.0, 1.0),
+    "alpha": 1.0,
+    "blend": (0, 6, 7),
+    "flags": (128, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0),
+    "refraction_power": 0.0,
+}
+# Remaining header bytes the examples share: depth bias, grayscale-to-palette, mask writes.
+_FO76_HEADER_TRAILER = bytes([0x00, 0x00, 0x3F])
+
+# Everything after the 10 texture slots, identical across the example files.
+_FO76_BGSM_TAIL = bytes.fromhex(
+    "00 00 00 01 00 00 80 3f 00 00 80 3f 00 00 80 3f 00 00 80 3f 00 00 00 3f 01 00 00 80 3f "
+    "00 00 80 3f 00 00 80 3f 00 00 80 3f 00 00 80 3f 00 00 a0 40 00 00 80 bf 00 00 80 bf "
+    "00 00 80 bf 00 00 80 bf 00 00 80 bf 01 00 00 00 00 00 01 00 00 00 00 00 00 00 00 80 3f "
+    "00 00 00 00 c8 42 00 00 00 00 00 00 00 00 00 00 00 80 3f 00 00 01 00 00 00 00 81 80 "
+    "00 3f 81 80 00 3f 81 80 00 3f 00 00 00 00 81 80 00 3f 00 00"
+)
+
+
+def _bgsm_string(text: str) -> bytes:
+    raw = (text or "").encode("latin-1", errors="replace") + b"\0"
+    return struct.pack("<I", len(raw)) + raw
+
+
+def build_fo76_bgsm(diffuse: str = "", normal: str = "", reflection: str = "", lightmap: str = "",
+                    header: dict = None) -> bytes:
+    # Texture arguments are game-relative paths (e.g. "ribbon/heels/Heels_d.dds"); an empty
+    # string leaves that slot unused. `header` (same shape as FO76_DEFAULT_HEADER, as read from
+    # a material by read_bgsm) overrides the defaults.
+    h = dict(FO76_DEFAULT_HEADER)
+    if header:
+        h.update({k: header[k] for k in FO76_DEFAULT_HEADER if k in header})
+
+    out = bytearray(b"BGSM")
+    out += struct.pack("<I", FO76_BGSM_VERSION)
+    out += struct.pack("<I", h["tile"])
+    out += struct.pack("<4f", *h["uv"])
+    out += struct.pack("<f", h["alpha"])
+    out += struct.pack("<BII", *h["blend"])
+    out += struct.pack("<12B", *h["flags"])
+    out += struct.pack("<f", h["refraction_power"])
+    out += _FO76_HEADER_TRAILER
+
+    # Texture slots: diffuse, normal, smooth-spec, greyscale, glow, wrinkles, specular (_r),
+    # lighting (_l), flow, distance-field alpha.
+    for tex in (diffuse, normal, "", "", "", "", reflection, lightmap, "", ""):
+        out += _bgsm_string(tex)
+
+    out += _FO76_BGSM_TAIL
+    return bytes(out)
+
+
+def fo76_game_path(out_file: Path, tex_root: Path) -> str:
+    # The path a material uses for a texture: everything after the last "Textures" folder in
+    # the real path if there is one, otherwise the path relative to the output folder.
+    parts = list(Path(os.path.abspath(str(out_file))).parts)
+    lowered = [x.lower() for x in parts]
+    if "textures" in lowered:
+        i = len(lowered) - 1 - lowered[::-1].index("textures")
+        rel = parts[i + 1:]
+    else:
+        rel = list(Path(os.path.abspath(str(out_file))).relative_to(
+            Path(os.path.abspath(str(tex_root)))).parts)
+    return "/".join(rel)
+
+
+def write_fo76_bgsm(jobs: list, material_dir: Path, tex_root: Path, header: dict = None) -> Path:
+    # One .bgsm per texture set, pointing at whichever of _d/_n/_r/_l were generated.
+    slots = {"_d.dds": "diffuse", "_n.dds": "normal", "_r.dds": "reflection", "_l.dds": "lightmap"}
+    paths, base = {}, None
+    for job in jobs:
+        name = job.out_path.name
+        for suffix, slot in slots.items():
+            if name.lower().endswith(suffix):
+                paths[slot] = fo76_game_path(job.out_path, tex_root)
+                base = base or name[:-len(suffix)]
+    if not paths or base is None:
+        raise ValueError("no texture outputs to reference")
+    material_dir = Path(material_dir)
+    material_dir.mkdir(parents=True, exist_ok=True)
+    out_path = material_dir / f"{base}.bgsm"
+    out_path.write_bytes(build_fo76_bgsm(header=header, **paths))
+    return out_path
+
+
+# Cubemap file-name keywords -> built-in preset. Order matters: the first hit wins, so the
+# specific names come before the generic "metal". This is a name-based heuristic - the
+# .bgsm only stores a path to the cubemap, not what material it represents.
+CUBEMAP_KEYWORDS = [
+    (("chrome",), "Chrome"),
+    (("gold", "brass"), "Gold / Brass"),
+    (("copper", "bronze"), "Copper"),
+    (("rust",), "Rusted / Dull"),
+    (("steel", "iron", "silver"), "Polished Steel"),
+    (("leather",), "Leather"),
+    (("cloth", "fabric", "cotton"), "Cloth / Fabric"),
+    (("metal",), "Polished Steel"),
+]
+# Presets whose reflections are visibly colored (not neutral), so the reflection map gets
+# tinted with the preset's color.
+TINTED_PRESETS = {"Gold / Brass", "Copper"}
+
+
+def classify_bgsm_material(info: "BgsmInfo"):
+    # Returns (preset_name or None, reason).
+    if not info.env_mapping or not info.cubemap.strip():
+        return "Cloth / Fabric", "no environment cubemap, so nothing to reflect"
+    name = Path(info.cubemap.replace("\\", "/")).stem.lower()
+    for words, preset in CUBEMAP_KEYWORDS:
+        if any(w in name for w in words):
+            return preset, f"cubemap '{Path(info.cubemap.replace(chr(92), '/')).name}'"
+    return None, f"cubemap '{Path(info.cubemap.replace(chr(92), '/')).name}' isn't recognised"
+
+
+def material_overrides_from_bgsm(info: "BgsmInfo"):
+    # Turns a material file into pipeline-parameter overrides (the same values choosing
+    # a preset would set), plus a human-readable description for the log/label.
+    preset, reason = classify_bgsm_material(info)
+    if preset is None:
+        return {}, f"{reason} - using the manual sliders"
+    metal, light, spec, color = MATERIAL_PRESETS[preset]
+    scale = min(3.0, max(0.1, info.env_mask_scale))
+    overrides = dict(
+        metal_offset=int(metal) - 180,
+        light_mult=float(light),
+        reflection_boost=min(3.0, max(0.1, spec * scale)),
+        # The cubemap says the material *can* reflect; the spec map says *where*.
+        # Gate the bias per pixel so e.g. leather on a chrome-cubemap material
+        # doesn't get blanket reflectivity.
+        gate_bias_by_spec=True,
+    )
+    if preset in TINTED_PRESETS:
+        overrides["tint_rgb"] = tuple(color)
+    return overrides, f"{reason} -> {preset}"
+
+
+def resolve_material_for_info(info: "BgsmInfo", fp: Path):
+    # Same as resolve_material_for_set, for when the material is already known.
+    overrides, desc = material_overrides_from_bgsm(info)
+    return overrides, f"{fp.name}: {desc}"
+
+
+def resolve_material_for_set(index: dict, diffuse_file: Path):
+    # (overrides, message) for one texture set, looked up through the materials index.
+    if not index:
+        return {}, "no materials loaded"
+    matches, note = find_bgsm_matches(index, diffuse_file)
+    if not matches:
+        return {}, f"{note} - using the manual sliders"
+    info, fp = matches[0]
+    overrides, desc = material_overrides_from_bgsm(info)
+    msg = f"{fp.name}: {desc}"
+    if note:
+        msg += f"  ({note})"
+    if len(matches) > 1:
+        others = ", ".join(m[1].name for m in matches[1:])
+        msg += (f"  [!] {len(matches)} materials share these textures (also {others}); "
+                f"used {fp.name}")
+    return overrides, msg
+
+
 # Used to auto-suggest a default brush color when you pick an input folder
 def get_average_color(image_path: Path) -> tuple:
     try:
@@ -302,8 +758,10 @@ def process_fo76_reflection_map(
     contrast: float = 1.35,
     bias: float = 0.0,
     spec_img: "Image.Image" = None,
-    use_env_mask: bool = True,
-    use_spec_tint: bool = True,
+    use_env_mask: bool = False,
+    use_spec_tint: bool = False,
+    tint_rgb: tuple = None,
+    gate_bias_by_spec: bool = False,
 ) -> "Image.Image":
 
     if diffuse_img.size != target_size:
@@ -335,7 +793,10 @@ def process_fo76_reflection_map(
     delta = spec_red - diffuse_luma
     reflect = diffuse_luma + delta * reflection_strength
     reflect = 0.5 + (reflect - 0.5) * contrast
-    reflect = reflect + bias
+    # Normally the bias lifts every pixel equally. When it comes from a material file's
+    # cubemap (gate_bias_by_spec), it's scaled by the spec map instead, so only areas
+    # the spec map marks as reflective receive it.
+    reflect = reflect + (bias * spec_red if gate_bias_by_spec else bias)
     reflect = np.clip(reflect, 0.0, 1.0)
 
     # Apply the FO4 environment mask (spec alpha) as a final per-pixel multiplier.
@@ -352,7 +813,13 @@ def process_fo76_reflection_map(
     # Reproduce that: pull the hue/saturation out of the spec map (with its own
     # luma factored out, since strength is already handled above) and apply it
     # as a per-channel tint over the achromatic reflectivity we just computed.
-    if use_spec_tint and spec_arr is not None:
+    if tint_rgb is not None:
+        # Material-level tint (e.g. gold/copper cubemap), constant across the texture.
+        t = np.asarray(tint_rgb, dtype=np.float32) / 255.0
+        t_luma = max(0.02, float(0.299 * t[0] + 0.587 * t[1] + 0.114 * t[2]))
+        tint = np.clip(t / t_luma, 0.0, 3.0)
+        reflect_rgb = np.clip(reflect[:, :, None] * tint[None, None, :], 0.0, 1.0)
+    elif use_spec_tint and spec_arr is not None:
         spec_rgb = spec_arr[:, :, :3]
         spec_luma = (0.299 * spec_rgb[:, :, 0] +
                      0.587 * spec_rgb[:, :, 1] +
@@ -478,8 +945,10 @@ def build_fo76_images(diffuse_path: Path, normal_path: Path, spec_path: Path,
                        metal_offset: int, light_mult: float,
                        reflection_boost: float = 1.6, use_white_ao: bool = True,
                        ao_strength: float = 1.4, sss_strength: int = 0,
-                       use_env_mask: bool = True,
-                       use_spec_tint: bool = True,
+                       use_env_mask: bool = False,
+                       use_spec_tint: bool = False,
+                       tint_rgb: tuple = None,
+                       gate_bias_by_spec: bool = False,
                        enabled_maps: set = None):
 
     if enabled_maps is None:
@@ -536,7 +1005,8 @@ def build_fo76_images(diffuse_path: Path, normal_path: Path, spec_path: Path,
         img_r_rgb = process_fo76_reflection_map(
             original_diffuse_img, spec_path, target_size,
             reflection_strength=reflection_boost, bias=reflectivity_bias,
-            use_env_mask=use_env_mask, use_spec_tint=use_spec_tint
+            use_env_mask=use_env_mask, use_spec_tint=use_spec_tint,
+            tint_rgb=tint_rgb, gate_bias_by_spec=gate_bias_by_spec
         )
         images["reflection"] = Image.merge(
             "RGBA", (*img_r_rgb.split(), Image.new("L", img_r_rgb.size, 255))
@@ -669,15 +1139,17 @@ class SetPreviewCache:
             return None
         return Image.merge("RGBA", (*self.normal_rgb.split(), Image.new("L", self.size, 255)))
 
-    def get_reflection(self, metal_offset: int, reflection_boost: float, use_env_mask: bool = True,
-                        use_spec_tint: bool = True):
+    def get_reflection(self, metal_offset: int, reflection_boost: float, use_env_mask: bool = False,
+                        use_spec_tint: bool = False, tint_rgb: tuple = None,
+                        gate_bias_by_spec: bool = False):
         self.ensure_loaded()
         if self.diffuse_base is None:
             return None
         img_r = process_fo76_reflection_map(
             self.diffuse_base, self.spec_path, self.size,
             reflection_strength=reflection_boost, bias=metal_offset / 255.0,
-            spec_img=self._spec_rgba, use_env_mask=use_env_mask, use_spec_tint=use_spec_tint
+            spec_img=self._spec_rgba, use_env_mask=use_env_mask, use_spec_tint=use_spec_tint,
+            tint_rgb=tint_rgb, gate_bias_by_spec=gate_bias_by_spec
         )
         return Image.merge("RGBA", (*img_r.split(), Image.new("L", self.size, 255)))
 
@@ -1515,14 +1987,17 @@ def prepare_texture_set_save_jobs(diffuse_path: Path, normal_path: Path, spec_pa
                                   use_white_ao: bool = True,
                                   ao_strength: float = 1.4,
                                   sss_strength: int = 0,
-                                  use_env_mask: bool = True,
-                                  use_spec_tint: bool = True,
+                                  use_env_mask: bool = False,
+                                  use_spec_tint: bool = False,
+                                  tint_rgb: tuple = None,
+                                  gate_bias_by_spec: bool = False,
                                   use_bc7_diffuse: bool = False,
                                   use_bc7_reflection: bool = False,
                                   texture_edits: dict = None,
-                                  enabled_maps: set = None) -> list:
+                                  enabled_maps: set = None,
+                                  output_base_name: str = None) -> list:
     
-    base_name = diffuse_path.stem.rsplit('_', 1)[0]
+    base_name = output_base_name or diffuse_path.stem.rsplit('_', 1)[0]
     output_dir.mkdir(parents=True, exist_ok=True)
     texture_edits = texture_edits or {}
     if enabled_maps is None:
@@ -1536,6 +2011,7 @@ def prepare_texture_set_save_jobs(diffuse_path: Path, normal_path: Path, spec_pa
         reflection_boost=reflection_boost, use_white_ao=use_white_ao,
         ao_strength=ao_strength, sss_strength=sss_strength,
         use_env_mask=use_env_mask, use_spec_tint=use_spec_tint,
+        tint_rgb=tint_rgb, gate_bias_by_spec=gate_bias_by_spec,
         enabled_maps=enabled_maps
     )
 
@@ -1567,8 +2043,10 @@ def prepare_texture_set_save_jobs(diffuse_path: Path, normal_path: Path, spec_pa
         label_bits = [('BC7 sRGB' if use_bc7_reflection else 'BC1 sRGB')]
         if use_env_mask:
             label_bits.append("envmask")
-        if use_spec_tint:
+        if use_spec_tint or tint_rgb is not None:
             label_bits.append("tinted")
+        if gate_bias_by_spec:
+            label_bits.append("from .bgsm")
         label = f"_r [{', '.join(label_bits)}]"
         jobs.append(SaveJob(images["reflection"].convert("RGB"), output_dir / f"{base_name}_r.dds",
                              r_fmt, False, label))
@@ -1587,23 +2065,28 @@ def process_texture_set_pbr(diffuse_path: Path, normal_path: Path, spec_path: Pa
                             use_white_ao: bool = True,
                             ao_strength: float = 1.4,
                             sss_strength: int = 0,
-                            use_env_mask: bool = True,
-                            use_spec_tint: bool = True,
+                            use_env_mask: bool = False,
+                            use_spec_tint: bool = False,
+                            tint_rgb: tuple = None,
+                            gate_bias_by_spec: bool = False,
                             use_bc7_diffuse: bool = False,
                             use_bc7_reflection: bool = False,
                             texture_edits: dict = None,
                             enabled_maps: set = None,
-                            log_func=print):
+                            log_func=print,
+                            output_base_name: str = None):
 
-    base_name = diffuse_path.stem.rsplit('_', 1)[0]
+    base_name = output_base_name or diffuse_path.stem.rsplit('_', 1)[0]
     jobs = prepare_texture_set_save_jobs(
         diffuse_path, normal_path, spec_path, output_dir,
         metal_offset, light_mult,
         reflection_boost=reflection_boost, use_white_ao=use_white_ao,
         ao_strength=ao_strength, sss_strength=sss_strength,
         use_env_mask=use_env_mask, use_spec_tint=use_spec_tint,
+        tint_rgb=tint_rgb, gate_bias_by_spec=gate_bias_by_spec,
         use_bc7_diffuse=use_bc7_diffuse, use_bc7_reflection=use_bc7_reflection,
-        texture_edits=texture_edits, enabled_maps=enabled_maps
+        texture_edits=texture_edits, enabled_maps=enabled_maps,
+        output_base_name=output_base_name
     )
 
     if not jobs:
@@ -1655,6 +2138,12 @@ class FO76PBRStudioGUI:
 
         # set_key -> (diffuse_path, normal_path, spec_path)
         self.available_sets = {}
+        # Parsed .bgsm materials (see build_bgsm_index) used by "pick material from .bgsm".
+        self.bgsm_index = {}
+        self.bgsm_materials = []          # [(BgsmInfo, path)] for every loaded .bgsm
+        self.set_materials = {}           # set_key -> (BgsmInfo, path), when sets come from the .bgsm files
+        self._materials_root = None
+        self._last_materials_dir = None
         # set_key -> {'diffuse': TextureEditState, 'normal': ..., ...}
         self.texture_edits = {}
         self.current_set_key = None
@@ -1673,6 +2162,9 @@ class FO76PBRStudioGUI:
         self.ball_photo = None
 
         self.create_widgets()
+        if self.settings.get("materials_dir") and (self.settings.get("auto_material", False)
+                                                   or self.settings.get("discover_from_bgsm", False)):
+            self._rebuild_bgsm_index()
 
     def create_widgets(self):
         header = ttk.Frame(self.root, padding="10")
@@ -1733,6 +2225,51 @@ class FO76PBRStudioGUI:
         self.output_entry.grid(row=1, column=1, sticky=tk.EW, padx=5, pady=2)
         ttk.Button(io_frame, text="Browse...", command=self.browse_output).grid(row=1, column=2, padx=2)
 
+        ttk.Label(io_frame, text="Materials Dir:").grid(row=2, column=0, sticky=tk.W)
+        self.materials_entry = ttk.Entry(io_frame)
+        self.materials_entry.grid(row=2, column=1, sticky=tk.EW, padx=5, pady=2)
+        self.materials_entry.insert(0, self.settings.get("materials_dir", ""))
+        ttk.Button(io_frame, text="Browse...", command=self.browse_materials).grid(row=2, column=2, padx=2)
+        self.materials_entry.bind("<FocusOut>", lambda e: self._on_materials_entry_changed())
+        self.materials_entry.bind("<Return>", lambda e: self._on_materials_entry_changed())
+
+        self.discover_var = tk.BooleanVar(value=self.settings.get("discover_from_bgsm", False))
+        ttk.Checkbutton(
+            io_frame,
+            text="Find texture sets from the .bgsm files (use the texture names they list, "
+                 "not _d/_n/_s names; output named after each .bgsm)",
+            variable=self.discover_var, command=self.on_discover_toggle
+        ).grid(row=3, column=0, columnspan=3, sticky=tk.W, pady=(4, 0))
+
+        self.auto_material_var = tk.BooleanVar(value=self.settings.get("auto_material", False))
+        ttk.Checkbutton(
+            io_frame,
+            text="Pick material from the .bgsm's environment cubemap (overrides the preset/sliders below)",
+            variable=self.auto_material_var, command=self.on_auto_material_toggle
+        ).grid(row=4, column=0, columnspan=3, sticky=tk.W, pady=(0, 0))
+        self.material_info_lbl = ttk.Label(io_frame, text="", foreground="#888", wraplength=420, justify=tk.LEFT)
+        self.material_info_lbl.grid(row=5, column=0, columnspan=3, sticky=tk.W)
+
+        ttk.Label(io_frame, text="FO76 Materials Out:").grid(row=6, column=0, sticky=tk.W, pady=(6, 0))
+        self.fo76_mat_entry = ttk.Entry(io_frame)
+        self.fo76_mat_entry.grid(row=6, column=1, sticky=tk.EW, padx=5, pady=(6, 2))
+        self.fo76_mat_entry.insert(0, self.settings.get("fo76_materials_dir", ""))
+        ttk.Button(io_frame, text="Browse...", command=self.browse_fo76_materials).grid(row=6, column=2, padx=2, pady=(6, 0))
+        self.fo76_mat_entry.bind("<FocusOut>", lambda e: self._save_bgsm_output_settings())
+
+        self.create_bgsm_var = tk.BooleanVar(value=self.settings.get("create_fo76_bgsm", False))
+        ttk.Checkbutton(
+            io_frame,
+            text="Create an FO76 .bgsm for each converted set (points at the new _d/_n/_r/_l textures)",
+            variable=self.create_bgsm_var, command=self._save_bgsm_output_settings
+        ).grid(row=7, column=0, columnspan=3, sticky=tk.W, pady=(2, 0))
+        ttk.Label(io_frame, text="Texture paths in the .bgsm are taken from after the last \"Textures\" folder "
+                                 "in the output path, or else relative to Output Dir. Surface flags (two-sided, "
+                                 "alpha test, etc.) are copied from the matching FO4 .bgsm when Materials Dir "
+                                 "is set.",
+                  foreground="#888", wraplength=420, justify=tk.LEFT
+                  ).grid(row=8, column=0, columnspan=3, sticky=tk.W)
+
         io_frame.columnconfigure(1, weight=1)
 
         # 2. PBR SLIDERS & PRESETS
@@ -1776,18 +2313,23 @@ class FO76PBRStudioGUI:
                                              variable=self.white_ao_var, command=self.on_white_ao_toggle)
         self.white_ao_chk.grid(row=5, column=0, columnspan=3, sticky=tk.W, pady=4)
 
-        self.env_mask_var = tk.BooleanVar(value=True)
+        # NOTE: vanilla FO4 _s.dds is BC5 (R = specular, G = gloss, no blue, no alpha),
+        # so there is no alpha env-mask or RGB tint in vanilla files. These two options
+        # only matter for custom/modded spec maps that actually carry that data, so
+        # they default to OFF. (Tinting a BC5 spec map would read gloss as a color
+        # channel and produce a bogus tint.)
+        self.env_mask_var = tk.BooleanVar(value=False)
         self.env_mask_chk = ttk.Checkbutton(
             slider_frame,
-            text="Apply FO4 Environment Map Mask (_s.dds Alpha) to Reflection (_r.dds)",
+            text="Apply Env Mask from _s.dds Alpha (custom spec maps only)",
             variable=self.env_mask_var, command=self.on_env_mask_toggle
         )
         self.env_mask_chk.grid(row=9, column=0, columnspan=3, sticky=tk.W, pady=4)
 
-        self.spec_tint_var = tk.BooleanVar(value=True)
+        self.spec_tint_var = tk.BooleanVar(value=False)
         self.spec_tint_chk = ttk.Checkbutton(
             slider_frame,
-            text="Tint Reflection Map with Specular Map Color (_s.dds RGB)",
+            text="Tint Reflection with _s.dds RGB (custom spec maps only)",
             variable=self.spec_tint_var, command=self.on_spec_tint_toggle
         )
         self.spec_tint_chk.grid(row=10, column=0, columnspan=3, sticky=tk.W, pady=4)
@@ -1962,10 +2504,25 @@ class FO76PBRStudioGUI:
             return
 
         self.available_sets = {}
-        for diff_file in sorted(in_dir.rglob("*_d.dds")):
-            norm_file, spec_file = find_set_files(diff_file)
-            key = get_set_key(diff_file, in_dir)
-            self.available_sets[key] = (diff_file, norm_file, spec_file)
+        self.set_materials = {}
+        if self.discover_var.get():
+            if self.bgsm_materials:
+                found, skipped = discover_texture_sets(self.bgsm_materials, in_dir, self._materials_root)
+                for st in found:
+                    self.available_sets[st["key"]] = (st["diffuse"], st["normal"], st["spec"])
+                    self.set_materials[st["key"]] = (st["info"], st["fp"])
+                note = f"; {len(skipped)} material(s) skipped (diffuse not in Input Dir)" if skipped else ""
+                self.log(f"[Info] Found {len(found)} texture set(s) from the .bgsm files{note}")
+                for sk in skipped[:3]:
+                    self.log(f"  - skipped {sk}")
+            else:
+                self.log("[Warning] Find-sets-from-.bgsm is on, but no .bgsm files are loaded - "
+                         "set the Materials Dir.")
+        else:
+            for diff_file in sorted(in_dir.rglob("*_d.dds")):
+                norm_file, spec_file = find_set_files(diff_file)
+                key = get_set_key(diff_file, in_dir)
+                self.available_sets[key] = (diff_file, norm_file, spec_file)
 
         keys = list(self.available_sets.keys())
         self.set_combo["values"] = keys
@@ -1977,16 +2534,18 @@ class FO76PBRStudioGUI:
             self.current_set_key = None
             self.set_combo.set("")
         self.preview_cache = None
+        self._refresh_material_info()
         self.update_active_preview()
 
     def on_set_selected(self, event=None):
         self.current_set_key = self.set_combo.get()
         self.preview_cache = None
+        self._refresh_material_info()
         self.update_active_preview()
 
     # Pipeline params / preview
-    def get_current_pipeline_params(self):
-        return dict(
+    def get_current_pipeline_params(self, apply_material=True):
+        params = dict(
             metal_offset=int(self.metal_slider.get()) - 180,
             light_mult=float(self.light_slider.get()),
             reflection_boost=float(self.spec_slider.get()),
@@ -1994,7 +2553,16 @@ class FO76PBRStudioGUI:
             sss_strength=int(self.sss_slider.get()),
             use_env_mask=self.env_mask_var.get(),
             use_spec_tint=self.spec_tint_var.get(),
+            tint_rgb=None,
+            gate_bias_by_spec=False,
         )
+        # For the selected set (preview), swap in the values its .bgsm implies. Batch export
+        # resolves this per set instead (apply_material=False + run_batch).
+        if (apply_material and self.auto_material_var.get() and self.bgsm_index
+                and self.current_set_key in self.available_sets):
+            overrides, _msg = self._material_for_set(self.current_set_key)
+            params.update(overrides)
+        return params
 
     def _build_current_set_images_full_res(self):
 
@@ -2035,7 +2603,7 @@ class FO76PBRStudioGUI:
         cache = self._get_preview_cache()
         base_color = cache.get_average_diffuse_color()
         params = self.get_current_pipeline_params()
-        metal_raw = int(self.metal_slider.get())
+        metal_raw = min(255, max(0, int(params["metal_offset"]) + 180))
 
         img = self.sphere_renderer.render(
             smoothness=metal_raw, metalness=metal_raw, base_color=base_color,
@@ -2066,7 +2634,8 @@ class FO76PBRStudioGUI:
                 img = cache.get_normal()
             elif kind == "reflection":
                 img = cache.get_reflection(params["metal_offset"], params["reflection_boost"],
-                                            params["use_env_mask"], params["use_spec_tint"])
+                                            params["use_env_mask"], params["use_spec_tint"],
+                                            params["tint_rgb"], params["gate_bias_by_spec"])
             elif kind == "lightmap":
                 img = cache.get_lightmap(params["use_white_ao"], params["sss_strength"])
             else:
@@ -2357,6 +2926,106 @@ class FO76PBRStudioGUI:
         self.preset_combo.set("")
         self.log(f"[Info] Deleted custom preset '{real_name}'.")
 
+    # Material (.bgsm) auto-detection
+    def browse_materials(self):
+        path = filedialog.askdirectory(title="Select Materials Directory (contains .bgsm files)")
+        if path:
+            self.materials_entry.delete(0, tk.END)
+            self.materials_entry.insert(0, path)
+            self._on_materials_entry_changed()
+
+    def _on_materials_entry_changed(self):
+        raw = self.materials_entry.get().strip().strip('"')
+        if raw == self._last_materials_dir:
+            return
+        self.settings["materials_dir"] = raw
+        save_app_settings(self.settings)
+        self._rebuild_bgsm_index()
+        self.update_active_preview()
+
+    def _rebuild_bgsm_index(self):
+        raw = self.materials_entry.get().strip().strip('"')
+        self._last_materials_dir = raw
+        self.bgsm_index = {}
+        self.bgsm_materials = []
+        self._materials_root = None
+        if raw:
+            p = Path(raw)
+            if not p.is_dir():
+                self.log(f"[Warning] Materials directory not found: {raw}")
+            else:
+                materials, errors = load_bgsm_materials(p)
+                index = index_bgsm_materials(materials)
+                loaded = len(materials)
+                self.bgsm_index = index
+                self.bgsm_materials = materials
+                self._materials_root = p
+                note = f" ({len(errors)} skipped)" if errors else ""
+                self.log(f"[Info] Loaded {loaded} material file(s) from {raw}{note}")
+                samples = sorted({k for lst in index.values() for k, _i, _f in lst})[:4]
+                if samples:
+                    self.log("[Info] Texture sets referenced by those materials, e.g.: " + ", ".join(samples))
+                for e in errors[:5]:
+                    self.log(f"  - skipped {e}")
+                if len(errors) > 5:
+                    self.log(f"  - ...and {len(errors) - 5} more skipped")
+        self._refresh_material_info()
+        if self.discover_var.get():
+            self.refresh_texture_sets()
+
+    def on_auto_material_toggle(self):
+        self.settings["auto_material"] = self.auto_material_var.get()
+        save_app_settings(self.settings)
+        if self.auto_material_var.get():
+            self._on_materials_entry_changed()
+            if not self.bgsm_index:
+                self.log("[Warning] Pick-material-from-.bgsm is on, but no .bgsm files are loaded - "
+                         "set the Materials Dir.")
+        self._refresh_material_info()
+        self.update_active_preview()
+
+    def on_discover_toggle(self):
+        self.settings["discover_from_bgsm"] = self.discover_var.get()
+        save_app_settings(self.settings)
+        if self.discover_var.get():
+            self._on_materials_entry_changed()
+        self.refresh_texture_sets()
+
+    def _material_for_set(self, set_key):
+        # (overrides, message) for a texture set: its own .bgsm when sets come from the
+        # materials, otherwise looked up by texture path.
+        if set_key in self.set_materials:
+            info, fp = self.set_materials[set_key]
+            return resolve_material_for_info(info, fp)
+        if self.bgsm_index and set_key in self.available_sets:
+            return resolve_material_for_set(self.bgsm_index, self.available_sets[set_key][0])
+        return {}, "no materials loaded"
+
+    def _refresh_material_info(self):
+        text = ""
+        if self.auto_material_var.get():
+            if not self.bgsm_index:
+                text = "No .bgsm files loaded - set the Materials Dir."
+            elif self.current_set_key in self.available_sets:
+                overrides, msg = self._material_for_set(self.current_set_key)
+                text = f"Selected set: {msg}"
+                if overrides:
+                    text += "  (preset/sliders overridden for this set)"
+        self.material_info_lbl.config(text=text)
+
+    # FO76 .bgsm output
+    def browse_fo76_materials(self):
+        path = filedialog.askdirectory(title="Select folder to write FO76 .bgsm files into")
+        if path:
+            self.fo76_mat_entry.delete(0, tk.END)
+            self.fo76_mat_entry.insert(0, path)
+            self._save_bgsm_output_settings()
+
+    def _save_bgsm_output_settings(self):
+        self.settings["fo76_materials_dir"] = self.fo76_mat_entry.get().strip().strip('"')
+        self.settings["create_fo76_bgsm"] = self.create_bgsm_var.get()
+        save_app_settings(self.settings)
+
     # Browsing / logging
     def browse_input(self):
         path = filedialog.askdirectory(title="Select Input Directory")
@@ -2409,7 +3078,39 @@ class FO76PBRStudioGUI:
                                   "Output Selection (Diffuse/Normal/Reflection/Lightmap).")
             return
 
-        params = self.get_current_pipeline_params()
+        params = self.get_current_pipeline_params(apply_material=False)
+        uses_materials = (self.auto_material_var.get() or self.discover_var.get()
+                          or self.create_bgsm_var.get())
+        if uses_materials and self.materials_entry.get().strip():
+            self._rebuild_bgsm_index()      # pick up any files added since it was last loaded
+
+        bgsm_index = None
+        if self.auto_material_var.get():
+            if not self.bgsm_index:
+                messagebox.showerror("Error", "Pick-material-from-.bgsm is on, but no .bgsm files were "
+                                              "loaded. Set the Materials Dir, or turn the option off.")
+                return
+            bgsm_index = self.bgsm_index
+
+        discovery_materials = None
+        if self.discover_var.get():
+            if not self.bgsm_materials:
+                messagebox.showerror("Error", "Find-texture-sets-from-.bgsm is on, but no .bgsm files were "
+                                              "loaded. Set the Materials Dir, or turn the option off.")
+                return
+            discovery_materials = list(self.bgsm_materials)
+
+        bgsm_out = None
+        fo4_index = None
+        if self.create_bgsm_var.get():
+            raw_mat_out = self.fo76_mat_entry.get().strip().strip('"')
+            if not raw_mat_out:
+                messagebox.showerror("Error", "\"Create an FO76 .bgsm\" is on, but no FO76 Materials Out "
+                                              "folder is set.")
+                return
+            bgsm_out = Path(raw_mat_out)
+            self._save_bgsm_output_settings()
+            fo4_index = self.bgsm_index or None     # source of FO4 surface flags, if loaded
         use_bc7_diffuse = self.bc7_diffuse_var.get()
         use_bc7_reflection = self.bc7_reflection_var.get()
         worker_count = self._resolve_worker_count()
@@ -2417,12 +3118,14 @@ class FO76PBRStudioGUI:
         threading.Thread(
             target=self.run_batch,
             args=(Path(in_dir), Path(out_dir), params, use_bc7_diffuse, use_bc7_reflection,
-                  enabled_maps, worker_count),
+                  enabled_maps, worker_count, bgsm_index, bgsm_out, fo4_index,
+                  discovery_materials, self._materials_root),
             daemon=True
         ).start()
 
     def run_batch(self, in_dir, out_dir, params, use_bc7_diffuse, use_bc7_reflection, enabled_maps,
-                  worker_count):
+                  worker_count, bgsm_index=None, bgsm_out=None, fo4_index=None,
+                  discovery_materials=None, materials_root=None):
         self.log("--- Starting FO76 Spec-Compliant Batch Conversion ---")
         self.log(f"[Info] Generating: {', '.join(sorted(enabled_maps)) if enabled_maps else 'nothing selected'}")
 
@@ -2433,24 +3136,57 @@ class FO76PBRStudioGUI:
             self.log(f"[Error] {e}")
             return
 
-        diffuse_files = list(in_dir.rglob("*_d.dds"))
+        # What to convert: (diffuse, normal, spec, set_key, output_base_name, material).
+        # Either one set per *_d.dds file, or one per .bgsm whose textures are in Input Dir.
+        work = []
+        if discovery_materials is not None:
+            found, skipped = discover_texture_sets(discovery_materials, in_dir, materials_root)
+            if skipped:
+                self.log(f"[Info] {len(skipped)} material(s) skipped (diffuse not in Input Dir), e.g. {skipped[0]}")
+            for st in found:
+                work.append((st["diffuse"], st["normal"], st["spec"], st["key"], st["fp"].stem,
+                             (st["info"], st["fp"])))
+            empty_msg = "[Warning] None of the loaded .bgsm files has its diffuse texture in Input Dir."
+        else:
+            for diff_file in sorted(in_dir.rglob("*_d.dds")):
+                norm_file, spec_file = find_set_files(diff_file)
+                work.append((diff_file, norm_file, spec_file, get_set_key(diff_file, in_dir), None, None))
+            empty_msg = "[Warning] No '*_d.dds' texture sets found."
 
-        if not diffuse_files:
-            self.log("[Warning] No '*_d.dds' texture sets found.")
+        if not work:
+            self.log(empty_msg)
             return
 
         # Phase 1: prepare every set's images (PIL/numpy - fast, sequential is fine).
-        self.log(f"[Info] Preparing {len(diffuse_files)} texture set(s)...")
+        self.log(f"[Info] Preparing {len(work)} texture set(s)...")
         save_jobs = []
         prep_failed = 0
-        for diff_file in diffuse_files:
-            norm_file, spec_file = find_set_files(diff_file)
-            set_key = get_set_key(diff_file, in_dir)
-
+        bgsm_written = bgsm_failed = 0
+        planned_outputs = set()
+        for diff_file, norm_file, spec_file, set_key, out_base, material in work:
             rel_dir = diff_file.parent.relative_to(in_dir)
             target_dir = out_dir / rel_dir
+            label = out_base or diff_file.stem.rsplit('_', 1)[0]
+
+            if out_base:
+                tag = (str(target_dir).lower(), out_base.lower())
+                if tag in planned_outputs:
+                    prep_failed += 1
+                    self.log(f"[Error] Skipped {label}: another material already writes "
+                             f"'{out_base}_*.dds' into {target_dir}")
+                    continue
+                planned_outputs.add(tag)
 
             edits_for_set = self.texture_edits.get(set_key, {})
+
+            set_params = dict(params)
+            if bgsm_index:
+                if material:
+                    overrides, msg = resolve_material_for_info(*material)
+                else:
+                    overrides, msg = resolve_material_for_set(bgsm_index, diff_file)
+                set_params.update(overrides)
+                self.log(f"  [Material] {label}: {msg}")
 
             try:
                 jobs = prepare_texture_set_save_jobs(
@@ -2459,14 +3195,33 @@ class FO76PBRStudioGUI:
                     use_bc7_reflection=use_bc7_reflection,
                     texture_edits=edits_for_set,
                     enabled_maps=enabled_maps,
-                    **params
+                    output_base_name=out_base,
+                    **set_params
                 )
                 if not jobs:
-                    self.log(f"  - Skipped {diff_file.stem}: no output types selected")
+                    self.log(f"  - Skipped {label}: no output types selected")
                 save_jobs.extend(jobs)
+
+                if bgsm_out is not None and jobs:
+                    try:
+                        fo4_header = None
+                        if material:
+                            fo4_header = material[0].header
+                        elif fo4_index:
+                            fo4_matches, _note = find_bgsm_matches(fo4_index, diff_file)
+                            if fo4_matches:
+                                fo4_header = fo4_matches[0][0].header
+                        mat_path = write_fo76_bgsm(jobs, bgsm_out / rel_dir, out_dir, fo4_header)
+                        bgsm_written += 1
+                        src = "flags from FO4 .bgsm" if fo4_header else "default flags"
+                        self.log(f"  ✓ {mat_path.name} (FO76 material, {src}) -> "
+                                 f"{fo76_game_path(jobs[0].out_path, out_dir)}")
+                    except Exception as e:
+                        bgsm_failed += 1
+                        self.log(f"[Error] Failed to write FO76 material for {label}: {e}")
             except Exception as e:
                 prep_failed += 1
-                self.log(f"[Error] Failed to prepare {diff_file.name}: {e}")
+                self.log(f"[Error] Failed to prepare {label}: {e}")
 
         if not save_jobs:
             self.log("[Warning] Nothing to encode.")
@@ -2483,7 +3238,7 @@ class FO76PBRStudioGUI:
             mode_desc = "one file at a time (parallel encoding is off)"
         else:
             mode_desc = f"{worker_count} parallel worker(s)"
-        self.log(f"[Info] Encoding {len(save_jobs)} file(s) across {len(diffuse_files)} set(s) "
+        self.log(f"[Info] Encoding {len(save_jobs)} file(s) across {len(work)} set(s) "
                  f"using {mode_desc}...")
 
         succeeded, failed = 0, 0
@@ -2518,6 +3273,10 @@ class FO76PBRStudioGUI:
         summary = f"\n✔ Batch Conversion Finished! {succeeded} file(s) saved, {failed} failed"
         if prep_failed:
             summary += f", {prep_failed} set(s) failed to prepare"
+        if bgsm_out is not None:
+            summary += f"; {bgsm_written} .bgsm written"
+            if bgsm_failed:
+                summary += f", {bgsm_failed} .bgsm failed"
         self.log(summary + ".\n")
 
 
